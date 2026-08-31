@@ -15,6 +15,7 @@
 import { signal } from "@preact/signals";
 
 import type {
+  CardIdentity,
   CardStatus,
   CertificateInfo,
   PendingInfo,
@@ -22,10 +23,11 @@ import type {
   SideOutput,
   SignResult,
   SigningFailure,
+  PinStatuses,
   TsaConfig,
 } from "./api";
 
-export type Screen = "card" | "sign" | "verify" | "settings";
+export type Screen = "card" | "identity" | "sign" | "verify" | "pin" | "settings";
 
 export const screen = signal<Screen>("card");
 
@@ -37,6 +39,18 @@ export const signCertificate = signal<CertificateInfo | null>(null);
 
 /** The 利用者証明用証明書, which needs no password. */
 export const authCertificate = signal<CertificateInfo | null>(null);
+
+/** The CA certificate above the 利用者証明用証明書. */
+export const authCaCertificate = signal<CertificateInfo | null>(null);
+
+/** The CA certificate above the 署名用証明書, once that password was presented. */
+export const signCaCertificate = signal<CertificateInfo | null>(null);
+
+/** Sensitive card-face data, process-local and cleared on disconnect or explicit removal. */
+export const cardIdentity = signal<CardIdentity | null>(null);
+
+/** The seven counters from the latest explicit PIN status read. */
+export const pinStatuses = signal<PinStatuses | null>(null);
 
 /**
  * Reflects what the card last reported about the signature password.
@@ -211,4 +225,8 @@ export function clearCard() {
   cardStatus.value = null;
   signCertificate.value = null;
   authCertificate.value = null;
+  signCaCertificate.value = null;
+  authCaCertificate.value = null;
+  cardIdentity.value = null;
+  pinStatuses.value = null;
 }

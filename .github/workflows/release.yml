@@ -61,10 +61,13 @@ jobs:
         run: npm ci --prefix ui
 
       - name: Build desktop application
+        if: runner.os != 'Windows'
         run: npm exec --prefix ui -- tauri build --no-bundle
 
-      # The desktop app and CLI are both named `myna-sign` in Cargo's target directory. Preserve
-      # the app before the CLI build replaces that path.
+      - name: Build desktop application and installers
+        if: runner.os == 'Windows'
+        run: npm exec --prefix ui -- tauri build --bundles msi,nsis --ci
+
       - name: Stage desktop application
         shell: bash
         env:
@@ -73,7 +76,17 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; else ext=""; fi
           mkdir -p dist
-          cp "target/release/myna-sign${ext}" "dist/myna-sign-${VERSION}-${TARGET}${ext}"
+          cp "target/release/myna-gui${ext}" "dist/myna-gui-${VERSION}-${TARGET}${ext}"
+
+      - name: Stage Windows installers
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          app_version="${VERSION#v}"
+          cp target/release/bundle/msi/*.msi "dist/Myna.GUI_${app_version}_x64_en-US.msi"
+          cp target/release/bundle/nsis/*setup.exe "dist/Myna.GUI_${app_version}_x64-setup.exe"
 
       - name: Build CLI
         run: cargo build --release --locked -p myna-sign --bin myna-sign

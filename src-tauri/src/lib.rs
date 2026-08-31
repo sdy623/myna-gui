@@ -22,7 +22,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use myna_sign::card::{CardSession, CardStatus, Sharing};
+use myna_sign::card::{
+    CardIdentity, CardSession, CardStatus, PinKind, PinStatuses, Sharing, SignCertificates,
+};
 use myna_sign::error::Error;
 use myna_sign::openpgp::{self, SignOptions};
 use myna_sign::pdf;
@@ -216,6 +218,11 @@ impl AppState {
         *self.signer.lock().expect("poisoned") = None;
     }
 
+    /// Forget the certificate cached for signing when another card application is selected.
+    fn invalidate_signer(&self) {
+        *self.signer.lock().expect("poisoned") = None;
+    }
+
     /// Run `body` with the open session, and find out whether the card is still there when it fails.
     ///
     /// The card is asked only after something has already gone wrong. Polling it would mean an
@@ -292,6 +299,97 @@ async fn disconnect(state: tauri::State<'_, AppState>) -> Result<()> {
 #[tauri::command]
 async fn auth_certificate(state: tauri::State<'_, AppState>) -> Result<CertificateInfo> {
     state.with_session(|session| Ok(session.auth_certificate()?))
+}
+
+/// The CA certificate above the 利用者証明用証明書 (`myna jpki cert -t auth_ca`).
+#[tauri::command]
+async fn auth_ca_certificate(state: tauri::State<'_, AppState>) -> Result<CertificateInfo> {
+    state.with_session(|session| Ok(session.auth_ca_certificate()?))
+}
+
+/// The CA certificate above the 署名用証明書 (`myna jpki cert -t sign_ca`).
+#[tauri::command]
+async fn sign_ca_certificate(state: tauri::State<'_, AppState>) -> Result<Option<CertificateInfo>> {
+    state.with_session(|session| Ok(session.sign_ca_certificate()?))
+}
+
+/// The seven retry counters printed by `myna pin status`, without spending an attempt.
+#[tauri::command]
+async fn pin_statuses(state: tauri::State<'_, AppState>) -> Result<PinStatuses> {
+    // Text and surface AP selection clears JPKI VERIFY. Clear the parallel UI-side cache before
+    // touching the card so no concurrent command can draw a signer that is no longer unlocked.
+    state.invalidate_signer();
+    state.with_session(|session| Ok(session.pin_statuses()?))
+}
+
+/// Read and verify the basic attributes, rendered card face and photograph.
+#[tauri::command]
+async fn read_card_identity(
+    state: tauri::State<'_, AppState>,
+    mut password: String,
+) -> Result<CardIdentity> {
+    state.invalidate_signer();
+    let result = state.with_session(|session| Ok(session.read_identity(&mut password)?));
+    // `CardSession` zeroes it too; this covers a missing session or any other pre-call path.
+    use zeroize::Zeroize as _;
+    password.zeroize();
+    result
+}
+
+/// Read the protected signing certificate and CA, then reset JPKI security status.
+#[tauri::command]
+async fn read_sign_certificates(
+    state: tauri::State<'_, AppState>,
+    mut password: String,
+) -> Result<SignCertificates> {
+    state.invalidate_signer();
+    let result = state.with_session(|session| Ok(session.read_sign_certificates(&mut password)?));
+    use zeroize::Zeroize as _;
+    password.zeroize();
+    result
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ChangePinKind {
+    Card,
+    Auth,
+    Sign,
+}
+
+impl From<ChangePinKind> for PinKind {
+    fn from(value: ChangePinKind) -> Self {
+        match value {
+            ChangePinKind::Card => PinKind::Card,
+            ChangePinKind::Auth => PinKind::Auth,
+            ChangePinKind::Sign => PinKind::Sign,
+        }
+    }
+}
+
+/// Change one credential, matching the three `myna pin change` subcommands.
+#[tauri::command]
+async fn change_pin(
+    state: tauri::State<'_, AppState>,
+    kind: ChangePinKind,
+    mut current: String,
+    mut new_value: String,
+) -> Result<()> {
+    state.invalidate_signer();
+    let result = state.with_session(|session| {
+        Ok(session.change_pin(kind.into(), &mut current, &mut new_value)?)
+    });
+    use zeroize::Zeroize as _;
+    current.zeroize();
+    new_value.zeroize();
+    result
+}
+
+/// Save an image the card command already returned, to a path chosen in the native dialog.
+#[tauri::command]
+async fn save_card_image(path: String, data: Vec<u8>) -> Result<()> {
+    std::fs::write(&path, data).map_err(|error| write_error(&path, error))?;
+    Ok(())
 }
 
 /// Attempts left on the signature password, without spending one.
@@ -1284,26 +1382,46 @@ async fn verify_pdf(
 /// carries more authority than this program has: nothing here is signed, and nothing here has
 /// consulted a revocation service.
 #[tauri::command]
-async fn export_verification(path: String, lines: Vec<String>) -> Result<()> {
+async fn export_verification(path: String, lines: Vec<String>, locale: String) -> Result<()> {
+    let english = locale.eq_ignore_ascii_case("en");
     let is_text = std::path::Path::new(&path)
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"));
     if !is_text {
         return Err(AppError::Failed {
-            message: "検証結果はテキストファイル（.txt）としてのみ書き出せます。".into(),
+            message: if english {
+                "Verification reports can only be exported as text files (.txt).".into()
+            } else {
+                "検証結果はテキストファイル（.txt）としてのみ書き出せます。".into()
+            },
         });
     }
 
-    let mut text = String::from("myna-sign 検証結果\n");
-    text.push_str(&format!("生成: {}\n\n", Timestamp::now()?.to_jst_minutes()));
+    let mut text = if english {
+        String::from("Myna GUI verification report\n")
+    } else {
+        String::from("Myna GUI 検証結果\n")
+    };
+    text.push_str(&format!(
+        "{}: {}\n\n",
+        if english { "Generated" } else { "生成" },
+        Timestamp::now()?.to_jst_minutes()
+    ));
     for line in &lines {
         text.push_str(line);
         text.push('\n');
     }
-    text.push_str("\nこのファイルは署名されていません。内容は誰でも書き換えられます。\n");
-    text.push_str(
-        "本アプリは失効情報サービスを参照しません。証明書が失効していても、この結果は変わりません。\n",
-    );
+    if english {
+        text.push_str("\nThis file is not signed. Anyone can modify its contents.\n");
+        text.push_str(
+            "This app does not access a revocation service. The result does not change even if the certificate has been revoked.\n",
+        );
+    } else {
+        text.push_str("\nこのファイルは署名されていません。内容は誰でも書き換えられます。\n");
+        text.push_str(
+            "本アプリは失効情報サービスを参照しません。証明書が失効していても、この結果は変わりません。\n",
+        );
+    }
 
     std::fs::write(&path, text).map_err(|e| write_error(&path, e))
 }
@@ -1362,6 +1480,13 @@ pub fn run() {
             connect,
             disconnect,
             auth_certificate,
+            auth_ca_certificate,
+            sign_ca_certificate,
+            pin_statuses,
+            read_card_identity,
+            read_sign_certificates,
+            change_pin,
+            save_card_image,
             sign_pin_retries,
             unlock,
             plan_outputs,

@@ -21,6 +21,47 @@ export interface CardStatus {
   authPinRetries: number | null;
 }
 
+/** Retry counters printed by `myna pin status`; reading them does not spend an attempt. */
+export interface PinStatuses {
+  cardPin: number | null;
+  textCodeA: number | null;
+  textCodeB: number | null;
+  surfaceCodeA: number | null;
+  surfaceCodeB: number | null;
+  authPin: number | null;
+  signPin: number | null;
+}
+
+/** An image held only in this WebView process. */
+export interface CardImage {
+  mimeType: string;
+  extension: string;
+  base64: string;
+}
+
+/** Verified text and rendered card-face information. The Individual Number is not returned. */
+export interface CardIdentity {
+  name: string;
+  address: string;
+  birthDate: string;
+  sex: string;
+  expiry: string;
+  nameImage: CardImage;
+  addressImage: CardImage;
+  photoPreview: CardImage;
+  photoOriginal: CardImage;
+  dataVerified: boolean;
+  cardPresentVerified: boolean;
+  expiryCoveredBySignature: boolean;
+}
+
+export type ChangePinKind = "card" | "auth" | "sign";
+
+export interface SignCertificates {
+  certificate: CertificateInfo;
+  caCertificate: CertificateInfo | null;
+}
+
 /**
  * Which characters of a name or address were replaced by a substitute.
  *
@@ -462,6 +503,17 @@ export const api = {
   connect: (reader: string | null) => invoke<CardStatus>("connect", { reader }),
   disconnect: () => invoke<void>("disconnect"),
   authCertificate: () => invoke<CertificateInfo>("auth_certificate"),
+  authCaCertificate: () => invoke<CertificateInfo>("auth_ca_certificate"),
+  signCaCertificate: () => invoke<CertificateInfo | null>("sign_ca_certificate"),
+  pinStatuses: () => invoke<PinStatuses>("pin_statuses"),
+  readCardIdentity: (password: string) =>
+    invoke<CardIdentity>("read_card_identity", { password }),
+  readSignCertificates: (password: string) =>
+    invoke<SignCertificates>("read_sign_certificates", { password }),
+  changePin: (kind: ChangePinKind, current: string, newValue: string) =>
+    invoke<void>("change_pin", { kind, current, newValue }),
+  saveCardImage: (path: string, data: number[]) =>
+    invoke<void>("save_card_image", { path, data }),
   /** Attempts left, without spending one. Asked before every unlock — see DESIGN §11.6. */
   signPinRetries: () => invoke<number | null>("sign_pin_retries"),
   unlock: (password: string) => invoke<CertificateInfo>("unlock", { password }),
@@ -526,8 +578,8 @@ export const api = {
    * The lines are the ones on screen — see `claims.ts`. The header and the disclaimer are added on
    * the Rust side so that no caller can leave them off.
    */
-  exportVerification: (path: string, lines: string[]) =>
-    invoke<void>("export_verification", { path, lines }),
+  exportVerification: (path: string, lines: string[], locale: "ja" | "en") =>
+    invoke<void>("export_verification", { path, lines, locale }),
 
   documentDigest: (path: string) => invoke<string>("document_digest", { path }),
 

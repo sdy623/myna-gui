@@ -2050,6 +2050,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
+name = "hayro-jpeg2000"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bab0c77d09c0d9b144d429d0bf0fcd4c63c01d5f6c33f9b8ed501283e0f1ef76"
+dependencies = [
+ "image",
+ "moxcms",
+]
+
+[[package]]
 name = "heck"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2952,7 +2962,7 @@ dependencies = [
 
 [[package]]
 name = "myna-sign"
-version = "2.0.0"
+version = "0.9.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -2961,6 +2971,7 @@ dependencies = [
  "cmpv2",
  "cms",
  "der 0.7.10",
+ "hayro-jpeg2000",
  "hex",
  "image",
  "lopdf",
@@ -2988,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "myna-sign-app"
-version = "2.0.0"
+version = "0.9.0"
 dependencies = [
  "hex",
  "myna-card",

@@ -1,0 +1,24 @@
+Myna GUI
+========
+
+Myna GUI preserves and extends code and Git history from:
+
+  myna-sign
+  https://github.com/soltia48/myna-sign
+  License declared by its Cargo package metadata: MIT
+
+JPKI command names and card workflow are based on the open-source myna project:
+
+  myna
+  https://github.com/jpki/myna
+
+Card access uses the myna-card Rust crate:
+
+  myna-card
+  https://crates.io/crates/myna-card
+
+Myna GUI is unofficial software. It is not provided, endorsed, or certified by
+J-LIS, Japan's Digital Agency, a municipality, or another government body.
+
+The bundled Noto Sans JP font under assets/fonts is distributed under the SIL
+Open Font License 1.1. Its license text is stored in the same directory.

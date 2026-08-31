@@ -4,6 +4,9 @@
 # Front-end dependencies and output
 /ui/node_modules/
 /ui/dist/
+/output/
+/.playwright-cli/
+/src-tauri/gen/schemas/windows-schema.json
 
 # Coverage / profiling output
 *.profraw

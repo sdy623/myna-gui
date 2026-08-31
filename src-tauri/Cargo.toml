@@ -1,11 +1,13 @@
 [package]
 name = "myna-sign-app"
-description = "The myna-sign desktop application."
+description = "The lightweight Myna GUI desktop application."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 
 [lib]
 # Tauri's mobile targets want a library; the desktop binary is a thin wrapper over it.

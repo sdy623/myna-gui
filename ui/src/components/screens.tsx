@@ -35,7 +35,10 @@ import {
   formatJst,
   LABELS,
   PIN_BLOCKED,
+  type AppError,
   type CertificateInfo,
+  type CardImage,
+  type ChangePinKind,
   type PdfSignatureVerification,
   type PendingAction,
   type PendingInfo,
@@ -56,7 +59,9 @@ import {
 } from "../lib/claims";
 import {
   acceptTestHierarchy,
+  authCaCertificate,
   authCertificate,
+  cardIdentity,
   cardStatus,
   clearCard,
   cleartext,
@@ -67,11 +72,13 @@ import {
   notify,
   pdfOptions,
   pending,
+  pinStatuses,
   resetPdfPlacement,
   screen,
   setSignPinRetries,
   signBusy,
   signCertificate,
+  signCaCertificate,
   signPendingBlocked,
   signProgress,
   signResults,
@@ -80,6 +87,7 @@ import {
   tsa,
   writeTsr,
 } from "../lib/state";
+import { locale, text, translateReportLine } from "../lib/i18n";
 import { PasswordDialog, type Disclosure, type SigningSubject } from "./PasswordDialog";
 import { PdfPlacement } from "./PdfPlacement";
 import { Claim, Signer, TimestampClaim, VerdictGroups } from "./Verdict";
@@ -165,9 +173,14 @@ function retriesConsequence(retries: number | null): string {
 async function connectCard(reader: string | null) {
   cardBusy.value = true;
   try {
-    cardStatus.value = await api.connect(reader);
-    if (cardStatus.value.hasAuthCertificate) {
+    const status = await api.connect(reader);
+    // A new session means every process-local value from the old card is stale, even when the
+    // reader name is the same.
+    clearCard();
+    cardStatus.value = status;
+    if (status.hasAuthCertificate) {
       authCertificate.value = await api.authCertificate();
+      authCaCertificate.value = await api.authCaCertificate();
     }
     notify("info", "カードを読み取りました。");
   } catch (e) {
@@ -201,12 +214,113 @@ async function disconnectCard() {
   }
 }
 
+function signingPasswordError(value: string): string | null {
+  if (/[a-z]/.test(value)) {
+    return text(
+      "英字は大文字で入力してください。",
+      "Use uppercase letters; the signing password is registered in uppercase.",
+    );
+  }
+  if (!/^[A-Z0-9]*$/.test(value)) {
+    return text("使えるのは英大文字と数字だけです。", "Only uppercase letters and digits are allowed.");
+  }
+  if (value.length < 6 || value.length > 16) {
+    return text("署名用パスワードは 6〜16 文字です。", "The signing password must be 6–16 characters.");
+  }
+  return null;
+}
+
+function describeCredentialError(error: AppError, label: string): string {
+  if (error.kind === "pinIncorrect") {
+    return error.retries === null
+      ? text(`${label}が違います。残り回数は不明です。`, `${label} is incorrect. Remaining attempts are unknown.`)
+      : text(
+          `${label}が違います。残り ${error.retries} 回です。`,
+          `${label} is incorrect. ${error.retries} attempt(s) remain.`,
+        );
+  }
+  if (error.kind === "pinBlocked") {
+    return text(
+      `${label}はロックされています。市区町村の窓口でのみ解除できます。`,
+      `${label} is locked and can only be reset at a municipal service counter.`,
+    );
+  }
+  return describe(error);
+}
+
 // --- Card ---------------------------------------------------------------------------------------
 
 export function CardScreen() {
   // `null` until asked, so "not searched yet" and "searched and found none" do not look alike.
   const [readers, setReaders] = useState<string[] | null>(null);
+  const [showSignRead, setShowSignRead] = useState(false);
+  const [signPassword, setSignPassword] = useState("");
+  const [showSignPassword, setShowSignPassword] = useState(false);
+  const [signReadBusy, setSignReadBusy] = useState(false);
+  const [signReadError, setSignReadError] = useState<string | null>(null);
+  const [lastAttemptConfirmed, setLastAttemptConfirmed] = useState(false);
   const busy = cardBusy.value;
+
+  async function readSigningCertificates(event: Event) {
+    event.preventDefault();
+    const invalid = signingPasswordError(signPassword);
+    if (invalid) {
+      setSignReadError(invalid);
+      return;
+    }
+    const remaining = cardStatus.value?.signPinRetries ?? null;
+    if ((remaining === null || remaining === 1) && !lastAttemptConfirmed) {
+      setLastAttemptConfirmed(true);
+      setSignReadError(
+        remaining === 1
+          ? text(
+              "次に間違えるとロックされます。内容を確認し、もう一度押してください。",
+              "One more incorrect entry will lock this password. Check it, then press again.",
+            )
+          : text(
+              "残り回数が不明です。次でロックされる可能性があります。確認してもう一度押してください。",
+              "The remaining count is unknown and the next entry may lock it. Check it, then press again.",
+            ),
+      );
+      return;
+    }
+
+    setSignReadBusy(true);
+    setSignReadError(null);
+    setShowSignPassword(false);
+    try {
+      const certificates = await api.readSignCertificates(signPassword);
+      signCertificate.value = certificates.certificate;
+      signCaCertificate.value = certificates.caCertificate;
+      setSignPassword("");
+      setShowSignRead(false);
+      setLastAttemptConfirmed(false);
+      try {
+        setSignPinRetries(await api.signPinRetries());
+      } catch {
+        // The certificate read succeeded; a counter that cannot be re-read does not undo it.
+      }
+      notify(
+        "info",
+        text(
+          "署名用証明書を読み取り、カード上の署名権限は直ちにリセットしました。",
+          "Read the signing certificate and immediately reset signing authorization on the card.",
+        ),
+      );
+    } catch (thrown) {
+      const failure = asAppError(thrown);
+      if (failure.kind === "pinIncorrect" && failure.retries !== null) {
+        setSignPinRetries(failure.retries);
+      } else if (failure.kind === "pinBlocked") {
+        setSignPinRetries(0);
+      }
+      setSignReadError(describeCredentialError(failure, text("署名用パスワード", "Signing password")));
+      setSignPassword("");
+      setLastAttemptConfirmed(false);
+    } finally {
+      setSignReadBusy(false);
+    }
+  }
 
   async function refresh() {
     cardBusy.value = true;
@@ -239,7 +353,10 @@ export function CardScreen() {
       </div>
 
       <p class="note">
-        接続時に読み出すのは利用者証明用電子証明書だけです。署名用電子証明書（氏名・住所・生年月日・性別）は、署名するときにパスワードを入力するまで読み出しません。
+        {text(
+          "接続時に読み出すのは利用者証明用電子証明書だけです。署名用電子証明書（氏名・住所・生年月日・性別）は、署名時または下の「署名用証明書を読む」でパスワードを入力したときだけ読み出します。",
+          "Only the authentication certificate is read when connecting. The signing certificate (name, address, date of birth, and sex) is read only after you enter its password for signing or choose Read signing certificate below.",
+        )}
       </p>
       <p class="note">
         接続している間、本アプリはカードを占有します。切断するまで、e-Tax や JPKI
@@ -292,20 +409,643 @@ export function CardScreen() {
 
       {authCertificate.value && (
         <details class="panel">
-          <summary>利用者証明用電子証明書（パスワード不要）</summary>
+          <summary>
+            {text(
+              "利用者証明用電子証明書 — auth（パスワード不要）",
+              "User-authentication certificate — auth (no PIN required)",
+            )}
+          </summary>
           <CertificateTable certificate={authCertificate.value} />
         </details>
       )}
 
+      {authCaCertificate.value && (
+        <details class="panel">
+          <summary>
+            {text("利用者証明用 CA 証明書 — auth_ca", "User-authentication CA certificate — auth_ca")}
+          </summary>
+          <CertificateTable certificate={authCaCertificate.value} />
+        </details>
+      )}
+
+      {status?.hasSignCertificate && !showSignRead && (
+        <div class="panel certificate-action">
+          <h2>{text("署名用証明書を読む", "Read the signing certificate")}</h2>
+          <p class="note">
+            {text(
+              "myna jpki cert -t sign（別名 signature / digital_signature）と sign_ca に相当します。6〜16 文字の署名用パスワードが必要です。読み取り後は署名権限を残しません。",
+              "Equivalent to myna jpki cert -t sign (aliases: signature / digital_signature) and sign_ca. It requires the 6–16 character signing password and does not leave the key authorized afterward.",
+            )}
+          </p>
+          <button onClick={() => setShowSignRead(true)} disabled={busy || retries === 0}>
+            {text("署名用証明書を読み取る", "Read signing certificate")}
+          </button>
+        </div>
+      )}
+
+      {showSignRead && (
+        <form class="panel credential-panel" onSubmit={readSigningCertificates}>
+          <h2>{text("署名用パスワード", "Signing password")}</h2>
+          <p class="warn-box">
+            {text(
+              `${retriesSummary(retries)}。誤入力はカードの残り回数を 1 回消費します。`,
+              `${retries === null ? "Remaining attempts unknown" : `${retries} attempt(s) remaining`}. An incorrect entry consumes one attempt.`,
+            )}
+          </p>
+          <label class="field">
+            <span>{text("6〜16 文字（英大文字・数字）", "6–16 uppercase letters or digits")}</span>
+            <input
+              type={showSignPassword ? "text" : "password"}
+              value={signPassword}
+              maxLength={16}
+              autoComplete="off"
+              spellcheck={false}
+              onInput={(event) => {
+                setSignPassword((event.currentTarget as HTMLInputElement).value);
+                setSignReadError(null);
+                setLastAttemptConfirmed(false);
+              }}
+            />
+          </label>
+          <label class="check">
+            <input
+              type="checkbox"
+              checked={showSignPassword}
+              onChange={(event) => setShowSignPassword(event.currentTarget.checked)}
+            />
+            <span>{text("入力を表示", "Show password")}</span>
+          </label>
+          {signReadError && <p class="form-error" role="alert">{signReadError}</p>}
+          <div class="row">
+            <button type="submit" disabled={signReadBusy || retries === 0}>
+              {signReadBusy ? text("読み取り中…", "Reading…") : text("読み取る", "Read")}
+            </button>
+            <button
+              type="button"
+              class="ghost"
+              disabled={signReadBusy}
+              onClick={() => {
+                setShowSignRead(false);
+                setSignPassword("");
+                setSignReadError(null);
+                setLastAttemptConfirmed(false);
+              }}
+            >
+              {text("キャンセル", "Cancel")}
+            </button>
+          </div>
+        </form>
+      )}
+
       {signCertificate.value && (
         <details class="panel" open>
-          <summary>署名用電子証明書</summary>
+          <summary>{text("署名用電子証明書 — sign", "Signing certificate — sign")}</summary>
           <p class="warn-box">
             この証明書には基本4情報が含まれます。.asc では埋め込むかどうかを選べます。PDF
             では必ず埋め込まれます。埋め込んだファイルを渡すことは、これらの情報を渡すことです。
           </p>
           <CertificateTable certificate={signCertificate.value} />
         </details>
+      )}
+
+      {signCaCertificate.value && (
+        <details class="panel">
+          <summary>{text("署名用 CA 証明書 — sign_ca", "Signing CA certificate — sign_ca")}</summary>
+          <CertificateTable certificate={signCaCertificate.value} />
+        </details>
+      )}
+
+      {status && (
+        <div class="status-block">
+          <strong>{text("失効状態：未照会", "Revocation status: not queried")}</strong>
+          <p class="note">
+            {text(
+              "証明書の有効期間・用途・署名・J-LIS ルートへのチェーンは検証できますが、現在の myna と本アプリは CRL/OCSP を問い合わせません。「失効していない」とは表示しません。",
+              "Validity, key usage, signatures and the chain to a J-LIS root can be checked, but current myna and this app do not query CRL or OCSP. The app never labels a certificate as not revoked.",
+            )}
+          </p>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function cardImageUrl(image: CardImage): string {
+  return `data:${image.mimeType};base64,${image.base64}`;
+}
+
+function decodeBase64(value: string): number[] {
+  const decoded = atob(value);
+  return Array.from(decoded, (character) => character.charCodeAt(0));
+}
+
+async function exportCardImage(image: CardImage, basename: string) {
+  const path = await save({
+    title: text("カード画像を保存", "Save card image"),
+    defaultPath: `${basename}.${image.extension}`,
+    filters: [
+      {
+        name: image.extension.toUpperCase(),
+        extensions: [image.extension],
+      },
+    ],
+  });
+  if (!path) return;
+  await api.saveCardImage(path, decodeBase64(image.base64));
+  notify("info", text("画像を保存しました。", "Image saved."));
+}
+
+function applyPinStatuses(values: Awaited<ReturnType<typeof api.pinStatuses>>) {
+  pinStatuses.value = values;
+  const status = cardStatus.value;
+  if (status) {
+    cardStatus.value = {
+      ...status,
+      authPinRetries: values.authPin,
+      signPinRetries: values.signPin,
+    };
+  }
+  // The backend selected the text and surface APs to read these counters. That clears JPKI VERIFY.
+  signCertificate.value = null;
+  signCaCertificate.value = null;
+}
+
+// --- Card face ----------------------------------------------------------------------------------
+
+export function IdentityScreen() {
+  const [password, setPassword] = useState("");
+  const [reveal, setReveal] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [dangerConfirmed, setDangerConfirmed] = useState(false);
+  const status = cardStatus.value;
+  const identity = cardIdentity.value;
+  const attempts = pinStatuses.value?.cardPin ?? null;
+
+  async function readIdentity(event: Event) {
+    event.preventDefault();
+    if (!/^\d{4}$/.test(password)) {
+      setError(text("暗証番号は 4 桁の数字です。", "The card PIN must be exactly four digits."));
+      return;
+    }
+    if ((attempts === null || attempts === 1) && !dangerConfirmed) {
+      setDangerConfirmed(true);
+      setError(
+        attempts === 1
+          ? text(
+              "次に間違えるとロックされます。暗証番号を確認して、もう一度押してください。",
+              "One more incorrect entry will lock this PIN. Check it, then press again.",
+            )
+          : text(
+              "残り回数が不明です。次でロックされる可能性があります。確認してもう一度押してください。",
+              "The remaining count is unknown and the next entry may lock it. Check it, then press again.",
+            ),
+      );
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    setReveal(false);
+    // Selecting 券面AP clears any JPKI VERIFY, and the Rust side mirrors that state.
+    signCertificate.value = null;
+    signCaCertificate.value = null;
+    try {
+      cardIdentity.value = await api.readCardIdentity(password);
+      setPassword("");
+      setDangerConfirmed(false);
+      try {
+        applyPinStatuses(await api.pinStatuses());
+      } catch {
+        // Personal data was read and verified; an optional counter refresh does not undo it.
+      }
+      notify(
+        "info",
+        text(
+          "券面情報と写真を読み取り、署名とカード存在証明を検証しました。",
+          "Read the card face and photograph, then verified the records and live-card proof.",
+        ),
+      );
+    } catch (thrown) {
+      const failure = asAppError(thrown);
+      if (failure.kind === "pinIncorrect" && failure.retries !== null && pinStatuses.value) {
+        pinStatuses.value = { ...pinStatuses.value, cardPin: failure.retries };
+      }
+      setError(describeCredentialError(failure, text("券面入力補助用暗証番号", "Card input-helper PIN")));
+      setPassword("");
+      setDangerConfirmed(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section class="screen identity-screen">
+      <h1>{text("券面・基本4情報", "Card face & identity")}</h1>
+
+      {!status && (
+        <div class="empty">
+          <p>{text("先にカードへ接続してください。", "Connect to a card first.")}</p>
+          <button class="ghost" onClick={() => (screen.value = "card")}>
+            {text("カード画面を開く", "Open Card screen")}
+          </button>
+        </div>
+      )}
+
+      {status && !status.physicalCard && (
+        <div class="warn-box">
+          {text(
+            "券面情報は物理マイナンバーカードにだけあります。スマホ用電子証明書では読み取れません。",
+            "Card-face data exists only on a physical Individual Number Card, not a mobile certificate.",
+          )}
+        </div>
+      )}
+
+      {status?.physicalCard && (
+        <form class="panel credential-panel" onSubmit={readIdentity}>
+          <h2>{text("カードから読み取る", "Read from card")}</h2>
+          <p class="note">
+            {text(
+              "4 桁の券面入力補助用暗証番号で基本4情報を読み、内部でのみ個人番号を照合番号Aとして使って券面画像と写真を取得します。個人番号は画面にもログにも返しません。",
+              "The four-digit input-helper PIN reads the basic attributes. The Individual Number is used only internally as verification code A to read the rendered fields and photograph; it is never returned to the UI or logs.",
+            )}
+          </p>
+          <label class="field compact-field">
+            <span>{text("券面入力補助用暗証番号（4 桁）", "Card input-helper PIN (4 digits)")}</span>
+            <input
+              type={reveal ? "text" : "password"}
+              inputMode="numeric"
+              pattern="[0-9]{4}"
+              maxLength={4}
+              value={password}
+              autoComplete="off"
+              onInput={(event) => {
+                setPassword((event.currentTarget as HTMLInputElement).value.replace(/\D/g, "").slice(0, 4));
+                setError(null);
+                setDangerConfirmed(false);
+              }}
+            />
+          </label>
+          <label class="check">
+            <input type="checkbox" checked={reveal} onChange={(event) => setReveal(event.currentTarget.checked)} />
+            <span>{text("入力を表示", "Show PIN")}</span>
+          </label>
+          {pinStatuses.value && (
+            <p class={attempts !== null && attempts <= 2 ? "warn-box" : "status-block"}>
+              {text("残り回数", "Attempts remaining")}: {attempts === null ? text("不明", "unknown") : attempts}
+            </p>
+          )}
+          {error && <p class="form-error" role="alert">{error}</p>}
+          <button type="submit" disabled={busy || attempts === 0}>
+            {busy ? text("読み取り・検証中…", "Reading & verifying…") : text("券面と写真を読む", "Read card face & photo")}
+          </button>
+        </form>
+      )}
+
+      {identity && (
+        <>
+          <div class="identity-card panel">
+            <div class="identity-photo-wrap">
+              <img
+                class="identity-photo"
+                src={cardImageUrl(identity.photoPreview)}
+                alt={text("カードから読み取った顔写真", "Portrait read from the card")}
+              />
+              <button class="ghost small" onClick={() => exportCardImage(identity.photoOriginal, "myna-card-photo")}>
+                {text("原本 JP2 を保存", "Save original JP2")}
+              </button>
+            </div>
+            <div class="identity-fields">
+              <div>
+                <span>{text("氏名（券面画像）", "Name (rendered)")}</span>
+                <img src={cardImageUrl(identity.nameImage)} alt={text("券面の氏名画像", "Rendered name")} />
+              </div>
+              <div>
+                <span>{text("住所（券面画像）", "Address (rendered)")}</span>
+                <img src={cardImageUrl(identity.addressImage)} alt={text("券面の住所画像", "Rendered address")} />
+              </div>
+            </div>
+          </div>
+
+          <div class="panel identity-details">
+            <h2>{text("基本4情報", "Basic identity attributes")}</h2>
+            <dl class="holder">
+              <dt>{text("氏名", "Name")}</dt><dd>{identity.name}</dd>
+              <dt>{text("住所", "Address")}</dt><dd>{identity.address}</dd>
+              <dt>{text("生年月日", "Date of birth")}</dt><dd>{identity.birthDate}</dd>
+              <dt>{text("性別", "Sex")}</dt><dd>{describeSex(identity.sex)}</dd>
+              <dt>{text("券面有効期限", "Card-face expiry")}</dt><dd>{identity.expiry}</dd>
+            </dl>
+          </div>
+
+          <div class="panel">
+            <h2>{text("読み取り検証", "Read verification")}</h2>
+            <Claim label={text("券面データの署名", "Card-face record signature")} tone={identity.dataVerified ? "ok" : "bad"}>
+              {identity.dataVerified ? text("検証済み", "Verified") : text("検証失敗", "Failed")}
+            </Claim>
+            <Claim label={text("実カード存在証明", "Live-card proof")} tone={identity.cardPresentVerified ? "ok" : "bad"}>
+              {identity.cardPresentVerified ? text("チャレンジ署名を検証済み", "Fresh challenge signature verified") : text("未検証", "Not verified")}
+            </Claim>
+            <Claim label={text("券面有効期限", "Card-face expiry")} tone="unknown">
+              {text(
+                "値は読み取り済みですが、この券面レコードの署名対象外です。",
+                "Read successfully, but this field is outside the signed part of the card-face record.",
+              )}
+            </Claim>
+          </div>
+
+          <div class="row">
+            <button class="ghost" onClick={() => exportCardImage(identity.nameImage, "myna-card-name")}>
+              {text("氏名 PNG を保存", "Save name PNG")}
+            </button>
+            <button class="ghost" onClick={() => exportCardImage(identity.addressImage, "myna-card-address")}>
+              {text("住所 PNG を保存", "Save address PNG")}
+            </button>
+            <button
+              class="ghost destructive"
+              onClick={() => {
+                cardIdentity.value = null;
+                notify("info", text("画面上の券面情報を消去しました。", "Cleared card-face data from the UI."));
+              }}
+            >
+              {text("画面から消去", "Clear from UI")}
+            </button>
+          </div>
+          <p class="note">
+            {text(
+              "情報と画像はこのアプリのメモリ内だけにあり、切断・消去・終了で破棄されます。保存ボタンを押した画像だけがディスクへ書き出されます。",
+              "Data and images remain only in this app's memory and are discarded on disconnect, clear, or exit. Only images you explicitly save are written to disk.",
+            )}
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
+// --- PIN management ----------------------------------------------------------------------------
+
+function counterTone(value: number | null): Tone {
+  if (value === null) return "unknown";
+  if (value === 0) return "bad";
+  return value <= 2 ? "warn" : "ok";
+}
+
+function counterText(value: number | null): string {
+  if (value === null) return text("カードが回数を報告しませんでした", "The card did not report a finite count");
+  if (value === 0) return text("ロック済み", "Locked");
+  return text(`残り ${value} 回`, `${value} attempt(s) remaining`);
+}
+
+function updateChangedPinRetry(kind: ChangePinKind, retries: number | null) {
+  if (retries === null || !pinStatuses.value) return;
+  const current = pinStatuses.value;
+  pinStatuses.value =
+    kind === "card"
+      ? { ...current, cardPin: retries }
+      : kind === "auth"
+        ? { ...current, authPin: retries }
+        : { ...current, signPin: retries };
+  if (kind === "sign") setSignPinRetries(retries);
+  if (kind === "auth" && cardStatus.value) {
+    cardStatus.value = { ...cardStatus.value, authPinRetries: retries };
+  }
+}
+
+interface PinChangePanelProps {
+  kind: ChangePinKind;
+  labelJa: string;
+  labelEn: string;
+  retries: number | null;
+  statusesLoaded: boolean;
+  onChanged: () => Promise<void>;
+}
+
+function PinChangePanel({ kind, labelJa, labelEn, retries, statusesLoaded, onChanged }: PinChangePanelProps) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [reveal, setReveal] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [dangerConfirmed, setDangerConfirmed] = useState(false);
+  const label = text(labelJa, labelEn);
+  const signing = kind === "sign";
+
+  function normalize(value: string): string {
+    const normalized = signing ? value.toUpperCase().replace(/[^A-Z0-9]/g, "") : value.replace(/\D/g, "");
+    return normalized.slice(0, signing ? 16 : 4);
+  }
+
+  function clearSecrets() {
+    setCurrent("");
+    setNext("");
+    setConfirm("");
+    setReveal(false);
+  }
+
+  async function submit(event: Event) {
+    event.preventDefault();
+    const currentError = signing
+      ? signingPasswordError(current)
+      : /^\d{4}$/.test(current)
+        ? null
+        : text("現在の暗証番号は 4 桁の数字です。", "The current PIN must be exactly four digits.");
+    const nextError = signing
+      ? signingPasswordError(next)
+      : /^\d{4}$/.test(next)
+        ? null
+        : text("新しい暗証番号は 4 桁の数字です。", "The new PIN must be exactly four digits.");
+    if (currentError || nextError) {
+      setError(currentError ?? nextError);
+      return;
+    }
+    if (next !== confirm) {
+      setError(text("新しい値と確認入力が一致しません。", "The new value and confirmation do not match."));
+      return;
+    }
+    if (current === next) {
+      setError(text("新しい値は現在の値と異なるものにしてください。", "Choose a new value different from the current one."));
+      return;
+    }
+    if ((retries === null || retries === 1) && !dangerConfirmed) {
+      setDangerConfirmed(true);
+      setError(
+        retries === 1
+          ? text("次に間違えるとロックされます。確認してもう一度押してください。", "One more error will lock it. Check the current value and press again.")
+          : text("残り回数が不明です。確認してもう一度押してください。", "Remaining attempts are unknown. Check the current value and press again."),
+      );
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    signCertificate.value = null;
+    signCaCertificate.value = null;
+    try {
+      await api.changePin(kind, current, next);
+      clearSecrets();
+      setDangerConfirmed(false);
+      await onChanged();
+      notify("info", text(`${label}を変更しました。`, `${label} changed.`));
+    } catch (thrown) {
+      const failure = asAppError(thrown);
+      if (failure.kind === "pinIncorrect") updateChangedPinRetry(kind, failure.retries);
+      if (failure.kind === "pinBlocked") updateChangedPinRetry(kind, 0);
+      setError(describeCredentialError(failure, label));
+      clearSecrets();
+      setDangerConfirmed(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form class="panel pin-change" onSubmit={submit}>
+      <input
+        type="text"
+        name="username"
+        value={`jpki-${kind}`}
+        autoComplete="username"
+        readOnly
+        hidden
+        aria-hidden="true"
+      />
+      <div class="panel-heading-row">
+        <div>
+          <h2>{label}</h2>
+          <span class={`retry-chip retry-${counterTone(retries)}`}>{counterText(retries)}</span>
+        </div>
+        <code>{kind === "card" ? "pin change card" : kind === "auth" ? "pin change auth" : "pin change sign"}</code>
+      </div>
+      <p class="note">
+        {signing
+          ? text("6〜16 文字の英大文字・数字。", "6–16 uppercase ASCII letters or digits.")
+          : text("4 桁の数字。", "Exactly four digits.")}
+        {text(" 現在の値が違うと残り回数を 1 回消費します。", " An incorrect current value consumes one attempt.")}
+      </p>
+      <div class="pin-fields">
+        {[
+          [text("現在の値", "Current value"), current, setCurrent, "current-password"],
+          [text("新しい値", "New value"), next, setNext, "new-password"],
+          [text("新しい値（確認）", "Confirm new value"), confirm, setConfirm, "new-password"],
+        ].map(([caption, value, setter, autocomplete]) => (
+          <label class="field" key={String(caption)}>
+            <span>{String(caption)}</span>
+            <input
+              type={reveal ? "text" : "password"}
+              inputMode={signing ? "text" : "numeric"}
+              maxLength={signing ? 16 : 4}
+              value={String(value)}
+              autoComplete={String(autocomplete)}
+              spellcheck={false}
+              onInput={(event) => {
+                (setter as (value: string) => void)(normalize((event.currentTarget as HTMLInputElement).value));
+                setError(null);
+                setDangerConfirmed(false);
+              }}
+            />
+          </label>
+        ))}
+      </div>
+      <label class="check">
+        <input type="checkbox" checked={reveal} onChange={(event) => setReveal(event.currentTarget.checked)} />
+        <span>{text("入力を表示", "Show values")}</span>
+      </label>
+      {error && <p class="form-error" role="alert">{error}</p>}
+      <button type="submit" disabled={busy || !statusesLoaded || retries === 0}>
+        {busy ? text("変更中…", "Changing…") : text("変更する", "Change")}
+      </button>
+      {!statusesLoaded && <p class="note">{text("先に上の「残り回数を読む」を押してください。", "Read the remaining attempts above first.")}</p>}
+    </form>
+  );
+}
+
+export function PinScreen() {
+  const [busy, setBusy] = useState(false);
+  const values = pinStatuses.value;
+  const status = cardStatus.value;
+
+  async function refresh(showNotice = true) {
+    setBusy(true);
+    signCertificate.value = null;
+    signCaCertificate.value = null;
+    try {
+      applyPinStatuses(await api.pinStatuses());
+      if (showNotice) notify("info", text("残り回数をカードから読み取りました。", "Read retry counters from the card."));
+    } catch (thrown) {
+      notify("error", describe(asAppError(thrown)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section class="screen pin-screen">
+      <h1>{text("PIN 状態・変更", "PIN status & change")}</h1>
+      {!status && (
+        <div class="empty">
+          <p>{text("先にカードへ接続してください。", "Connect to a card first.")}</p>
+          <button class="ghost" onClick={() => (screen.value = "card")}>{text("カード画面を開く", "Open Card screen")}</button>
+        </div>
+      )}
+      {status && (
+        <>
+          <div class="row">
+            <button onClick={() => refresh()} disabled={busy}>
+              {busy ? text("読み取り中…", "Reading…") : text("残り回数を読む", "Read remaining attempts")}
+            </button>
+          </div>
+          <p class="note">
+            {text(
+              "この読み取り自体は回数を消費しません。表示は現在の myna pin status と同じ 7 項目です。",
+              "Reading counters does not consume an attempt. These are the same seven entries shown by current myna pin status.",
+            )}
+          </p>
+          {values && (
+            <div class="panel pin-status-grid">
+              {[
+                [text("券面入力補助AP 暗証番号", "Input-helper PIN"), values.cardPin, "card"],
+                [text("券面入力補助AP 照合番号A", "Input-helper code A"), values.textCodeA, "text A"],
+                [text("券面入力補助AP 照合番号B", "Input-helper code B"), values.textCodeB, "text B"],
+                [text("券面事項確認AP 照合番号A", "Card-face code A"), values.surfaceCodeA, "visual A"],
+                [text("券面事項確認AP 照合番号B", "Card-face code B"), values.surfaceCodeB, "visual B"],
+                [text("JPKI 利用者証明用暗証番号", "JPKI authentication PIN"), values.authPin, "auth"],
+                [text("JPKI 署名用パスワード", "JPKI signing password"), values.signPin, "sign"],
+              ].map(([label, count, alias]) => (
+                <Claim key={String(alias)} label={String(label)} tone={counterTone(count as number | null)}>
+                  {counterText(count as number | null)} <code>{String(alias)}</code>
+                </Claim>
+              ))}
+            </div>
+          )}
+          <div class="pin-change-grid">
+            <PinChangePanel
+              kind="card"
+              labelJa="券面入力補助用暗証番号"
+              labelEn="Card input-helper PIN"
+              retries={values?.cardPin ?? null}
+              statusesLoaded={values !== null}
+              onChanged={() => refresh(false)}
+            />
+            <PinChangePanel
+              kind="auth"
+              labelJa="利用者証明用暗証番号"
+              labelEn="JPKI authentication PIN"
+              retries={values?.authPin ?? null}
+              statusesLoaded={values !== null}
+              onChanged={() => refresh(false)}
+            />
+            <PinChangePanel
+              kind="sign"
+              labelJa="署名用パスワード"
+              labelEn="JPKI signing password"
+              retries={values?.signPin ?? null}
+              statusesLoaded={values !== null}
+              onChanged={() => refresh(false)}
+            />
+          </div>
+        </>
       )}
     </section>
   );
@@ -468,6 +1208,8 @@ export function SignScreen() {
   }, []);
 
   useEffect(() => {
+    // Browser-only preview builds do not expose Tauri's window metadata. The desktop WebView does.
+    if (!("__TAURI_INTERNALS__" in window)) return;
     // A drop is delivered by the operating system to the window, which sits above the modal: while
     // the confirmation is up, or a run is under way, changing the selection would change the set of
     // files `afterUnlock` reads — and that set has already been shown and agreed to.
@@ -572,7 +1314,9 @@ export function SignScreen() {
   async function choose(append: boolean) {
     const picked = await open({
       multiple: true,
-      title: append ? "追加で署名するファイルを選ぶ" : "署名するファイルを選ぶ",
+      title: append
+        ? text("追加で署名するファイルを選ぶ", "Choose more files to sign")
+        : text("署名するファイルを選ぶ", "Choose files to sign"),
     });
     if (!picked) return;
     const paths = Array.isArray(picked) ? picked : [picked];
@@ -582,8 +1326,8 @@ export function SignScreen() {
   async function chooseImage() {
     const picked = await open({
       multiple: false,
-      title: "ページに描く画像を選ぶ",
-      filters: [{ name: "画像", extensions: ["png", "jpg", "jpeg"] }],
+      title: text("ページに描く画像を選ぶ", "Choose an image to place on the page"),
+      filters: [{ name: text("画像", "Images"), extensions: ["png", "jpg", "jpeg"] }],
     });
     if (typeof picked === "string") setOptions({ imagePath: picked });
   }
@@ -658,7 +1402,10 @@ export function SignScreen() {
     const outputs: string[] = [];
     for (const item of items) {
       const chosen = await save({
-        title: `${basename(item.source)} の署名の保存先`,
+        title: text(
+          `${basename(item.source)} の署名の保存先`,
+          `Save signature for ${basename(item.source)}`,
+        ),
         defaultPath: item.output,
       });
       if (typeof chosen !== "string") {
@@ -706,7 +1453,7 @@ export function SignScreen() {
     // silence with the card unlocked and the 基本4情報 on screen, having signed nothing.
     if (isPdf) {
       const output = await save({
-        title: "署名した PDF の保存先",
+        title: text("署名した PDF の保存先", "Save signed PDF"),
         defaultPath: files[0].replace(/\.pdf$/i, "") + ".signed.pdf",
         filters: [{ name: "PDF", extensions: ["pdf"] }],
       });
@@ -753,6 +1500,12 @@ export function SignScreen() {
     // The certificate carries the 基本4情報; keeping it lets the card screen show what the
     // signature will disclose, and saves asking for the password again.
     signCertificate.value = certificate;
+    try {
+      signCaCertificate.value = await api.signCaCertificate();
+    } catch {
+      // A missing CA copy does not make the holder certificate or private-key operation invalid.
+      signCaCertificate.value = null;
+    }
     setSubjects(null);
     signBusy.value = true;
     try {
@@ -1584,6 +2337,8 @@ export function VerifyScreen() {
   }, [testHierarchy]);
 
   useEffect(() => {
+    // Keep the web UI independently previewable; native file drops are attached inside Tauri only.
+    if (!("__TAURI_INTERNALS__" in window)) return;
     // Dropping onto this screen fills a slot and stops there. Which slot a file belongs in is a
     // guess from its extension, and a guess is not enough to start a verification whose subject the
     // reader has not seen named.
@@ -1625,14 +2380,23 @@ export function VerifyScreen() {
     const picked = await open({
       multiple: false,
       // macOS shows no filter name in the panel, so the title is the only place this can be said.
-      title: "署名ファイル（.asc / .sig）または署名済み PDF を選ぶ",
-      filters: [{ name: "署名ファイル・署名済み PDF", extensions: ["asc", "sig", "pdf"] }],
+      title: text(
+        "署名ファイル（.asc / .sig）または署名済み PDF を選ぶ",
+        "Choose a signature file (.asc / .sig) or signed PDF",
+      ),
+      filters: [{
+        name: text("署名ファイル・署名済み PDF", "Signature files and signed PDFs"),
+        extensions: ["asc", "sig", "pdf"],
+      }],
     });
     if (typeof picked === "string") verifySignaturePath.value = picked;
   }
 
   async function pickDocument() {
-    const picked = await open({ multiple: false, title: "署名対象の原本を選ぶ" });
+    const picked = await open({
+      multiple: false,
+      title: text("署名対象の原本を選ぶ", "Choose the signed original file"),
+    });
     if (typeof picked === "string") verifyDocumentPath.value = picked;
   }
 
@@ -1665,13 +2429,17 @@ export function VerifyScreen() {
   async function exportResult() {
     if (!outcome || outcome.kind === "error") return;
     const path = await save({
-      title: "検証結果の保存先",
-      defaultPath: `${basename(verifiedPath(outcome))}-検証結果.txt`,
-      filters: [{ name: "テキスト", extensions: ["txt"] }],
+      title: text("検証結果の保存先", "Save verification report"),
+      defaultPath: `${basename(verifiedPath(outcome))}-${text("検証結果", "verification-result")}.txt`,
+      filters: [{ name: text("テキスト", "Text"), extensions: ["txt"] }],
     });
     if (typeof path !== "string") return;
     try {
-      await api.exportVerification(path, reportFor(outcome, includePersonalDetails));
+      await api.exportVerification(
+        path,
+        reportFor(outcome, includePersonalDetails).map((line) => translateReportLine(line)),
+        locale.value,
+      );
       notify("info", "検証結果をテキストで書き出しました。");
     } catch (e) {
       notify("error", describe(asAppError(e)));
@@ -1767,7 +2535,6 @@ export function VerifyScreen() {
           </div>
         )}
       </div>
-
       {outcome === null && (
         <div class="empty">
           <p>
@@ -1944,6 +2711,21 @@ export function SettingsScreen() {
             </small>
           </span>
         </label>
+      </div>
+      <div class="panel about-panel">
+        <h2>{text("このアプリについて", "About this app")}</h2>
+        <p>
+          {text(
+            "Myna GUI は、端末内で動作する非公式のローカル優先アプリです。J-LIS または行政機関が提供する公式アプリではありません。",
+            "Myna GUI is an unofficial, local-first application. It is not provided by J-LIS or any government agency.",
+          )}
+        </p>
+        <p class="note">
+          {text(
+            "テレメトリはありません。PIN と文書は端末内で処理され、タイムスタンプを有効にした場合だけ署名ハッシュが選択先へ送られます。",
+            "There is no telemetry. PINs and documents are processed on this device; only a signature hash is sent when timestamping is enabled.",
+          )}
+        </p>
       </div>
     </section>
   );
